@@ -1,9 +1,18 @@
+import logging
+
 from authlib.integrations.starlette_client import OAuth
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse
+from starlette.responses import JSONResponse
 
 from ..config import settings
+from ..database import get_async_session
+from ..models import User
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 router = APIRouter()
 
@@ -28,20 +37,56 @@ async def google_login(request: Request):
 
 
 @router.get("/auth/callback")
-async def auth_callback(request: Request):
+async def auth_callback(
+    request: Request, session: AsyncSession = Depends(get_async_session)
+):
     token = await oauth.google.authorize_access_token(request)
-    user = token.get("userinfo")
+    user_info = token.get("userinfo")
 
-    if user:
-        request.session["user"] = dict(user)
-        return JSONResponse(
-            {
-                "status": "success",
-                "user": {
-                    "email": user.get("email"),
-                    "name": user.get("name"),
-                    "picture": user.get("picture"),
-                },
-            }
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Failed to get user info")
+
+    try:
+        stmt = select(User).where(User.email == user_info["email"])
+        result = await session.execute(stmt)
+        db_user = result.scalar_one_or_none()
+
+        if db_user is None:
+            db_user = User(
+                email=user_info["email"],
+                name=user_info["name"],
+                picture=user_info["picture"],
+            )
+            session.add(db_user)
+        else:
+            db_user.name = user_info["name"]
+            db_user.picture = user_info["picture"]
+
+        await session.commit()
+
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Database error during user operation: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create user data",
         )
-    return JSONResponse({"status": "error"}, status_code=400)
+
+    request.session["user"] = {
+        "id": db_user.id,
+        "email": db_user.email,
+        "name": db_user.name,
+        "picture": db_user.picture,
+    }
+
+    return JSONResponse(
+        {
+            "status": "success",
+            "user": {
+                "id": db_user.id,
+                "email": db_user.email,
+                "name": db_user.name,
+                "picture": db_user.picture,
+            },
+        }
+    )
